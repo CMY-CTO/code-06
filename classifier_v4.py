@@ -40,6 +40,8 @@ from utils import rotation_conversions as rc
 # # 设置CUDA_LAUNCH_BLOCKING环境变量
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 def init_weight(m):
     if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear) or isinstance(m, nn.ConvTranspose1d):
         nn.init.xavier_normal_(m.weight)
@@ -108,25 +110,47 @@ class TextEncoder(nn.Module):
     def forward(self, x):
         # 检查输入索引是否在词汇表范围内
         if torch.max(x) >= self.vocab_size or torch.min(x) < 0:
+            print(f"Input tensor out of bounds: x shape: {x.shape}, Max index: {torch.max(x)}, Min index: {torch.min(x)}, Vocab size: {self.vocab_size}")
             raise ValueError(f"Input indices are out of bounds. Max index: {torch.max(x)}, Min index: {torch.min(x)}, Vocab size: {self.vocab_size}")
 
         # 打印输入张量的最大最小值
-        print(f"Input tensor max: {torch.max(x)}, min: {torch.min(x)}")
+        # print(f"Input tensor max: {torch.max(x)}, min: {torch.min(x)}, Vocab size: {self.vocab_size}")
 
-        x = self.embedding(x).permute(0, 2, 1)
-        # (batch_size, seq_len, embed_dim) -> (batch_size, embed_dim, seq_len)  [32 8000 300]
+        # 确保索引值在范围内，并转换为 long 类型
+        x = torch.clamp(x, min=0, max=self.vocab_size - 1).long()
+
+        # 再次打印调试信息以确认 clamp 后的值
+        # print(f"After clamping - Input tensor: {x}")
+
+        # 确保输入张量的数据类型为 long
+        # print(f"Text Input tensor dtype: {x.dtype}")
+
+        # 打印输入张量的形状
+        # print(f"Text Input tensor shape: {x.shape}")
+
+        # 使用断言确保所有索引值在词汇表范围内
+        assert torch.all(x >= 0) and torch.all(x < self.vocab_size), f"Index out of range: {x}"
+
+        # 在调用 embedding 之前同步 CUDA 设备
+        torch.cuda.synchronize()
+
+        # 打印 embedding 层的参数
+        # print(f"Embedding weight shape: {self.embedding.weight.shape}")
+        # print(f"Embedding weight max: {torch.max(self.embedding.weight)}, min: {torch.min(self.embedding.weight)}")
+
+        try:
+            x = self.embedding(x).permute(0, 2, 1)
+        except Exception as e:
+            print(f"Error during embedding: {e}")
+            print(f"Input tensor: {x}")
+            raise  # 重新引发异常，停止执行
+
+        # 打印 embedding 后的形状
         print("embedding_shape", x.shape)
 
         x = self.conv(x).permute(0, 2, 1)
-        # (batch_size, embed_dim, seq_len) -> (batch_size, seq_len, output_dim)
         print("embedding_conv_shape", x.shape)
 
-        # if x.shape[2] != 256:
-        #     x = torch.nn.functional.interpolate(x.permute(0, 1, 2), size=256, mode='nearest').permute(0, 1, 2)
-        #     print("embedding_conv_feature_dim_shape", x.shape)
-        # if x.shape[1] != self.seq_len:
-        #     x = torch.nn.functional.interpolate(x, size=self.seq_len, mode='nearest')
-        #     print("embedding_conv_seqlen_shape", x.shape)
         return x
 
 class MotionTextClassifier(nn.Module):
@@ -151,12 +175,7 @@ class MotionTextClassifier(nn.Module):
         print("motion_features_shape", motion_features.shape)
         text_features = self.text_encoder(text)
         print("text_features_shape", text_features.shape)
-        if text_features.shape[1] != motion_features.shape[1]:
-            text_features = torch.nn.functional.interpolate(text_features.permute(0, 2, 1), size=motion_features.shape[1], mode='nearest').permute(0, 2, 1)
-        print("text_features_interp_seqlen_shape", text_features.shape)
-        if text_features.shape[2] != motion_features.shape[2]:
-            text_features = torch.nn.functional.interpolate(text_features, size=motion_features.shape[2], mode='nearest')
-        print("text_features_interp_feature_shape", text_features.shape)
+
         combined_features = torch.cat((motion_features, text_features), dim=2)
         print("cat_shape", combined_features.shape)
 
@@ -166,10 +185,14 @@ class MotionTextClassifier(nn.Module):
         # print("cat_mean_shape_clip_level", combined_features.shape)
 
 
-        # 将特征展平为 (batch_size * seq_len, feature_dim)
-        # frame level
-        combined_features = combined_features.view(-1, 512)  # 调整维度为512
-        print("cat_view_shape_frame_level", combined_features.shape)
+        # # 将特征展平为 (batch_size * seq_len, feature_dim)
+        # # frame level
+        # combined_features = combined_features.view(-1, 512)  # 调整维度为512
+        # print("cat_view_shape_frame_level", combined_features.shape)
+
+        # 不进行平均池化，保持帧级别
+        combined_features = combined_features.view(-1, 512)  # 保持帧级别
+        print("combined_features_shape_frame_level", combined_features.shape)
 
         output = self.fc(combined_features)
         return output
@@ -669,9 +692,28 @@ class CustomDataset(Dataset):
             # 序列化&反序列化
             sample = pyarrow.deserialize(sample)
             # sample = pickle.loads(sample)
-            tar_pose, trans, in_shape, in_word, sem = sample
+            tar_pose, in_shape, in_word, sem, trans = sample
+            # tar_pose, trans, in_shape, in_word, sem = sample
             sem = torch.from_numpy(np.copy(sem)).float()
             in_word = torch.from_numpy(np.copy(in_word)).float() if self.args.word_cache else torch.from_numpy(np.copy(in_word)).int()
+
+
+            # print(f"word shape: {in_word.shape}, word: {in_word}")
+            # print(f"sem shape: {sem.shape}, sem: {sem}")
+            # print(f"word shape: {in_word.shape}")
+            # print(f"sem shape: {sem.shape}")
+
+            vocab_size = self.lang_model.n_words
+            if torch.max(in_word) >= vocab_size or torch.min(in_word) < 0:
+                print(f"__getitem__ tensor out of bounds")
+                print(f"Warning: Word indices out of bounds before processing. Max index: {torch.max(in_word)}, Min index: {torch.min(in_word)}, Vocab size: {vocab_size}")
+                in_word = torch.clamp(in_word, min=0, max=vocab_size-1)
+
+            # 打印调试信息
+            # print(f"__getitem__ - in_word max: {torch.max(in_word)}, min: {torch.min(in_word)}, vocab_size: {vocab_size}")
+
+
+
             if self.loader_type == "test":
                 tar_pose = torch.from_numpy(np.copy(tar_pose)).float()
                 trans = torch.from_numpy(np.copy(trans)).float()
@@ -694,9 +736,9 @@ class CustomDataset(Dataset):
                 # assume 10：1
                 # loss.repeat --> frame
                 # 打印 sem 的形状以进行调试
-                print(f"sem shape: {sem.shape}")
+                # print(f"sem shape: {sem.shape}")
 
-                
+
                 #### TODO frame level
                 # 如果 sem 的形状是 [seq_len]
                 # if len(sem.shape) == 1:
@@ -714,14 +756,11 @@ class CustomDataset(Dataset):
                 #     mean_sem = sem.mean(dim=1)
                 #     labels[mean_sem > 0.1] = 2
                 #     labels[(mean_sem > 0) & (mean_sem <= 0.1)] = 1
-                 ### TODO clip level - frame count threshold# 确保 sem 的形状是 [seq_len, 3]
-                if len(sem.shape) != 2 or sem.shape[1] != 3:
-                    raise ValueError(f"Expected sem to be a 2D tensor with shape [seq_len, 3], but got shape {sem.shape}")
 
-                # 计算大于 0.1 的帧数
-                count_above_threshold = torch.sum(sem.mean(dim=1) > 0.1).item()
-                label = 2 if count_above_threshold > (sem.shape[0] * self.threshold) else 1
-                
+                # # 计算大于 0.1 的帧数
+                # count_above_threshold = torch.sum(sem.mean(dim=1) > 0.1).item()
+                # label = 1 if count_above_threshold > (sem.shape[0] * self.threshold) else 0
+
             else:
                 in_shape = torch.from_numpy(np.copy(in_shape)).reshape((in_shape.shape[0], -1)).float()
                 trans = torch.from_numpy(np.copy(trans)).reshape((trans.shape[0], -1)).float()
@@ -729,39 +768,39 @@ class CustomDataset(Dataset):
                 tar_pose = torch.from_numpy(np.copy(tar_pose)).reshape((tar_pose.shape[0], -1)).float()
                 # in_facial = torch.from_numpy(in_facial).reshape((in_facial.shape[0], -1)).float()
                 # label = 2 if sem.mean().item() > 0.1 else (1 if sem.mean().item() > 0 else 0)
+                # print(f"beta shape: {in_shape.shape}")
+                # print(f"trans shape: {trans.shape}")
+                # print(f"pose shape: {tar_pose.shape}")
 
-                #### TODO clip level - mean 0.188(average semantic score)
-                # label = 2 if sem.mean().item() > 0.188 else (1 if sem.mean().item() > 0 else 0)
+
+                # #### TODO clip level - mean 0.188(average semantic score)
+
+                # label = 1 if sem.mean().item() > 0.188 else 0
 
                 ### TODO Frame-level label
-                # 如果 sem 的形状是 [seq_len]
-                # if len(sem.shape) == 1:
-                #     # Frame-level label: 根据每一帧的 sem 来判断 label
-                #     labels = torch.zeros_like(sem, dtype=torch.long)
-                #     labels[sem > 0.1] = 2
-                #     labels[(sem > 0) & (sem <= 0.1)] = 1
-                # else:
-                #     # 确保 sem 的形状是 [seq_len, 3]
-                #     if len(sem.shape) != 2 or sem.shape[1] != 3:
-                #         raise ValueError(f"Expected sem to be a 2D tensor with shape [seq_len, 3], but got shape {sem.shape}")
+                # 生成帧级别的标签
+                labels = torch.zeros_like(sem, dtype=torch.long)
+                labels[sem > 0.1] = 2
+                labels[(sem > 0) & (sem <= 0.1)] = 1
 
-                #     # Frame-level label: 根据每一帧的 sem 来判断 label
-                #     labels = torch.zeros(sem.shape[0], dtype=torch.long)
-                #     mean_sem = sem.mean(dim=1)
-                #     labels[mean_sem > 0.1] = 2
-                #     labels[(mean_sem > 0) & (mean_sem <= 0.1)] = 1
-                
                 ### TODO clip level - frame count threshold
-                # 确保 sem 的形状是 [seq_len, 3]
-                if len(sem.shape) != 2 or sem.shape[1] != 3:
-                    raise ValueError(f"Expected sem to be a 2D tensor with shape [seq_len, 3], but got shape {sem.shape}")
 
-                # 计算大于 0.1 的帧数
-                count_above_threshold = torch.sum(sem.mean(dim=1) > 0.1).item()
-                label = 2 if count_above_threshold > (sem.shape[0] * self.threshold) else 1
+                # # 计算大于 0.1 的帧数
+                # count_above_threshold = torch.sum(sem > 0.1).item()
+                # label = 1 if count_above_threshold > (sem.shape[0] * self.threshold) else 0
 
 
-            return {"pose": tar_pose, "beta": in_shape, "word": in_word, "sem": sem, "trans": trans, "label": label}
+            # # 将 label 转换为张量
+            # label = torch.tensor(labels, dtype=torch.long)
+            # # print("label shape",label.shape)
+
+
+
+
+
+
+
+            return {"pose": tar_pose, "beta": in_shape, "word": in_word, "sem": sem, "trans": trans, "label": labels}
 
 class MotionPreprocessor:
     def __init__(self, skeletons):
@@ -855,10 +894,9 @@ class MotionPreprocessor:
                 print("pass - check_spine_angle {:.5f}".format(max(angles)))
             return False
 
-
+'''
 def collate_fn(batch):
-    # 这里假设每个样本都是一个字典，包含 'pose', 'beta', 'word', 'sem', 'trans' 和 'label' 键
-    
+    # 直接将 'pose'、'beta'、'word'、'sem'、'trans' 和 'label' 保留为列表形式
     poses = [item['pose'] for item in batch]
     betas = [item['beta'] for item in batch]
     words = [item['word'] for item in batch]
@@ -866,37 +904,99 @@ def collate_fn(batch):
     trans = [item['trans'] for item in batch]
     labels = [item['label'] for item in batch]
 
-    poses_padded = pad_sequence(poses, batch_first=True)
-    betas_padded = pad_sequence(betas, batch_first=True)
-    sems_padded = pad_sequence(sems, batch_first=True)
-    trans_padded = pad_sequence(trans, batch_first=True)
+    # poses_padded = pad_sequence(poses, batch_first=True)
+    # betas_padded = pad_sequence(betas, batch_first=True)
+    # words_padded = pad_sequence(trans, batch_first=True)
+    # sems_padded = pad_sequence(sems, batch_first=True)
+    # trans_padded = pad_sequence(trans, batch_first=True)
 
-    max_text_len = max(len(t) for t in words)
-    words_tensor = torch.zeros(len(words), max_text_len, dtype=torch.long)
-    for i, text in enumerate(words):
-        words_tensor[i, :len(text)] = text
+    poses_tensor = torch.tensor(poses, dtype=torch.long)
+    betas_tensor = torch.tensor(betas, dtype=torch.long)
+    words_tensor = torch.tensor(words, dtype=torch.long)
+    sems_tensor = torch.tensor(sems, dtype=torch.long)
+    trans_tensor = torch.tensor(trans, dtype=torch.long)
+
 
     #clip-based
     labels_tensor = torch.tensor(labels, dtype=torch.long)
-    
-    # frame-based
-    labels_padded = pad_sequence(labels, batch_first=True)
+
+    # # frame-based
+    # labels_padded = pad_sequence(labels, batch_first=True)
 
     return {
-        "pose": poses_padded,
-        "beta": betas_padded,
+        "pose": poses_tensor,
+        "beta": betas_tensor,
         "word": words_tensor,
-        "sem": sems_padded,
-        "trans": trans_padded,
+        "sem": sems_tensor,
+        "trans": trans_tensor,
         "label": labels_tensor
-        # clip level
-        # "label": torch.tensor(labels, dtype=torch.long)
-        # frame level
-        # padded
+    }
+'''
+'''
+def collate_fn(batch):
+    # 保留 'pose'、'beta'、'word'、'sem'、'trans' 和 'label' 为列表形式
+    poses = [item['pose'] for item in batch]
+    betas = [item['beta'] for item in batch]
+    words = [item['word'] for item in batch]
+    sems = [item['sem'] for item in batch]
+    trans = [item['trans'] for item in batch]
+    labels = [item['label'] for item in batch]
+
+    return {
+        "pose": poses,
+        "beta": betas,
+        "word": words,
+        "sem": sems,
+        "trans": trans,
+        "label": labels
+    }
+'''
+
+def custom_collate_fn(batch):
+    pose_batch = torch.stack([item['pose'] for item in batch])
+    beta_batch = torch.stack([item['beta'] for item in batch])
+    word_batch = torch.stack([item['word'] for item in batch])
+    sem_batch = torch.stack([item['sem'] for item in batch])
+    trans_batch = torch.stack([item['trans'] for item in batch])
+
+    # clip-based
+    # label_batch = torch.tensor([item['label'].item() for item in batch])
+
+    # frame—based
+    label_batch = torch.stack([item['label'] for item in batch])
+
+    # # 打印调试信息
+    # print(f"Collate fn - Pose batch shape: {pose_batch.shape}")
+    # print(f"Collate fn - Beta batch shape: {beta_batch.shape}")
+    # print(f"Collate fn - Word batch shape: {word_batch.shape}")
+    # print(f"Collate fn - Sem batch shape: {sem_batch.shape}")
+    # print(f"Collate fn - Trans batch shape: {trans_batch.shape}")
+    # print(f"Collate fn - Label batch shape: {label_batch.shape}")
+
+    # 打印 word_batch 的详细信息
+    # print(f"Collate fn - Word batch max: {torch.max(word_batch)}, min: {torch.min(word_batch)}")
+
+    # 确保 word 中的索引在词汇表范围内
+    # with open(f"{args.data_path}\\weights\\vocab.pkl", 'rb') as f:
+    #             lang_model = pickle.load(f)
+    vocab_size = 11195
+    if torch.max(word_batch) >= vocab_size or torch.min(word_batch) < 0:
+        print(f"Collate fn - Word batch out of bounds. Max index: {torch.max(word_batch)}, Min index: {torch.min(word_batch)}, Vocab size: {vocab_size}")
+        raise ValueError(f"Word batch indices are out of bounds. Max index: {torch.max(word_batch)}, Min index: {torch.min(word_batch)}, Vocab size: {vocab_size}")
+
+    return {
+        "pose": pose_batch,
+        "beta": beta_batch,
+        "word": word_batch,
+        "sem": sem_batch,
+        "trans": trans_batch,
+        "label": label_batch
     }
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, output_path, log_path):
-    # 设置日志记录
+# 全局变量来存储标签计数
+global_label_counts = {"train": defaultdict(int), "val": defaultdict(int)}
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, output_path, log_path, num_classes):
     logging.basicConfig(filename=log_path, level=logging.INFO, format='%(asctime)s %(message)s')
     best_val_acc = 0.0
 
@@ -906,26 +1006,63 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         all_labels = []
         all_preds = []
 
-        label_counts = defaultdict(int)
+        # 重置标签计数
+        global_label_counts["train"].clear()
 
         for batch in train_loader:
             try:
-                inputs, texts, labels = batch['pose'].cuda(), batch['word'].cuda(), batch['label'].cuda()
+                # 重新初始化 CUDA 设备
+                torch.cuda.empty_cache()
+
+                # 从 batch 中提取数据，并移动到 GPU
+                inputs = batch['pose'].cuda()
+                betas = batch['beta'].cuda()
+                words = batch['word'].cuda().long()  # 确保转换为 long 类型
+                sems = batch['sem'].cuda()
+                trans = batch['trans'].cuda()
+                labels = batch['label'].cuda()
+
+                # 打印调试信息
+                print(f"Training batch labels: {labels}")
+                print(f"Max label: {labels.max()}, Min label: {labels.min()}")
+                # print(f"Training batch inputs shape: {inputs.shape}")
+                # print(f"Training batch betas shape: {betas.shape}")
+                # print(f"Training batch words shape: {words.shape}")
+
+                # # 打印 words 的详细信息
+                # print(f"Words tensor: {words}")
+                # print(f"Words tensor max: {torch.max(words)}, min: {torch.min(words)}")
+
+                # # 确保 word 中的索引在词汇表范围内
+                # if torch.max(words) >= model.text_encoder.vocab_size or torch.min(words) < 0:
+                #     print("training")
+                #     raise ValueError(f"Word indices out of bounds. Max index: {torch.max(words)}, Min index: {torch.min(words)}, Vocab size: {model.text_encoder.vocab_size}")
+
+
+                # 确保标签在正确的范围内
+                if labels.max().item() >= num_classes or labels.min().item() < 0:
+                    raise ValueError(f"Label value out of range. Max label: {labels.max()}, Min label: {labels.min()}")
+
                 optimizer.zero_grad()
-                outputs = model(inputs, texts)
+                outputs = model(inputs, words)
 
-                print(f"[Training before view]  outputs shape: {outputs.shape}, labels shape: {labels.shape}")
-                print(f"[Training before view] outputs sample: {outputs[0]}, labels sample: {labels[0]}")
-
-                # 展平为一维
-                labels = labels.view(-1)
-                # outputs = outputs.view(-1)
-                print(f"[Training after view]  outputs shape: {outputs.shape}, labels shape: {labels.shape}")
-                print(f"[Training after view] outputs sample: {outputs[0]}, labels sample: {labels[0]}")
+                print(f"[Training Before View]Outputs shape: {outputs.shape}, Labels shape: {labels.shape}")
+                print(f"[Training Before View]Outputs sample: {outputs[0]}, Labels sample: {labels[0]}")
 
 
+                outputs = outputs.view(-1, num_classes)  # 展平为 (batch_size * seq_len, num_classes)
+                labels = labels.view(-1)  # 展平为 (batch_size * seq_len)
+
+
+                print(f"[Training]Outputs shape: {outputs.shape}, Labels shape: {labels.shape}")
+                print(f"[Training]Outputs sample: {outputs[0]}, Labels sample: {labels[0]}")
 
                 loss = criterion(outputs, labels)
+
+                # 检查损失值是否有效
+                if torch.isnan(loss) or torch.isinf(loss):
+                    raise ValueError(f"Invalid loss value: {loss.item()}")
+
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item()
@@ -935,14 +1072,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 all_preds.extend(preds.cpu().numpy())
 
                 for label in labels.cpu().numpy():
-                    label_counts[label] += 1
+                    global_label_counts["train"][label] += 1
 
             except Exception as e:
+
                 print(f"Error during training: {e}")
-                continue
+                torch.cuda.synchronize()  # 强制同步 CUDA 设备
+                raise  # 重新引发异常，停止执行
+                # continue
 
         train_acc = accuracy_score(all_labels, all_preds)
-        val_acc, val_loss = evaluate_model(model, val_loader, criterion)
+        val_acc, val_loss = evaluate_model(model, val_loader, criterion, num_classes)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -953,92 +1093,121 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         log_message = f"Epoch {epoch+1}/{num_epochs}, Train Loss: {running_loss/len(train_loader)}, Train Acc: {train_acc}, Val Loss: {val_loss}, Val Acc: {val_acc}"
         print(log_message)
         logging.info(log_message)
-        print(f"Label counts: {dict(label_counts)}")
-        logging.info(f"Label counts: {dict(label_counts)}")
+        # print(f"Train Label counts: {dict(global_label_counts['train'])}")
+        # logging.info(f"Train Label counts: {dict(global_label_counts['train'])}")
+        # print(f"Validation Label counts: {dict(global_label_counts['val'])}")
+        # logging.info(f"Validation Label counts: {dict(global_label_counts['val'])}")
 
-def evaluate_model(model, dataloader, criterion):
+def evaluate_model(model, dataloader, criterion, num_classes):
     model.eval()
     running_loss = 0.0
     all_labels = []
     all_preds = []
 
-    label_counts = defaultdict(int)
+    # 重置标签计数
+    global_label_counts["val"].clear()
 
     with torch.no_grad():
         for batch in dataloader:
-            inputs, texts, labels = batch['pose'].cuda(), batch['word'].cuda(), batch['label'].cuda()
-            outputs = model(inputs, texts)
+            try:
+                # 重新初始化 CUDA 设备
+                torch.cuda.empty_cache()
+
+                # 从 batch 中提取数据，并移动到 GPU
+                inputs = batch['pose'].cuda()
+                betas = batch['beta'].cuda()
+                words = batch['word'].cuda()
+                sems = batch['sem'].cuda()
+                trans = batch['trans'].cuda()
+                labels = batch['label'].cuda()
+
+
+                print(f"Validation batch labels: {labels}")
+                print(f"Max label: {labels.max()}, Min label: {labels.min()}")
+                # print(f"Validation batch inputs shape: {inputs.shape}")
+                # print(f"Validation batch betas shape: {betas.shape}")
+                # print(f"Validation batch words shape: {words.shape}")
+
+                # # 打印 words 的详细信息
+                # print(f"Words tensor: {words}")
+                # print(f"Words tensor max: {torch.max(words)}, min: {torch.min(words)}")
+
+                # # 确保 word 中的索引在词汇表范围内
+                # if torch.max(words) >= model.text_encoder.vocab_size or torch.min(words) < 0:
+                #     print("Validation")
+                #     raise ValueError(f"Word indices out of bounds. Max index: {torch.max(words)}, Min index: {torch.min(words)}, Vocab size: {model.text_encoder.vocab_size}")
+
+
+                # 确保标签在正确的范围内
+                if labels.max().item() >= num_classes or labels.min().item() < 0:
+                    raise ValueError(f"Label value out of range. Max label: {labels.max()}, Min label: {labels.min()}")
+
+
+                outputs = model(inputs, words)
+
+                print(f"[Validation Before View]Outputs shape: {outputs.shape}, Labels shape: {labels.shape}")
+                print(f"[Validation Before View]Outputs sample: {outputs[0]}, Labels sample: {labels[0]}")
+
+                outputs = outputs.view(-1, num_classes)  # 展平为 (batch_size * seq_len, num_classes)
+                labels = labels.view(-1)  # 展平为 (batch_size * seq_len)
+
+                loss = criterion(outputs, labels)
+
+                print(f"[Validation]Outputs shape: {outputs.shape}, Labels shape: {labels.shape}")
+                print(f"[Validation]Outputs sample: {outputs[0]}, Labels sample: {labels[0]}")
 
 
 
-            print(f"[Validation before view] outputs shape: {outputs.shape}, labels shape: {labels.shape}")
-            print(f"[Validation before view] outputs sample: {outputs[0]}, labels sample: {labels[0]}")
+                # 检查损失值是否有效
+                if torch.isnan(loss) or torch.isinf(loss):
+                    raise ValueError(f"Invalid loss value: {loss.item()}")
 
-            # 展平为一维
-            labels = labels.view(-1)
-            # outputs = outputs.view(-1)
-            print(f"[Validation after view] outputs shape: {outputs.shape}, labels shape: {labels.shape}")
-            print(f"[Validation after view] outputs sample: {outputs[0]}, labels sample: {labels[0]}")
+                running_loss += loss.item()
 
+                preds = torch.argmax(outputs, dim=1)
+                all_labels.extend(labels.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
 
+                for label in labels.cpu().numpy():
+                    global_label_counts["val"][label] += 1
 
-            loss = criterion(outputs, labels)
-            running_loss += loss.item()
-
-            preds = torch.argmax(outputs, dim=1)
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-
-            for label in labels.cpu().numpy():
-                label_counts[label] += 1
+            except Exception as e:
+                print(f"Error during validation: {e}")
+                torch.cuda.synchronize()  # 强制同步 CUDA 设备
+                raise  # 重新引发异常，停止执行
 
     acc = accuracy_score(all_labels, all_preds)
-    print(f"Validation Label counts: {dict(label_counts)}")
-    logging.info(f"Validation Label counts: {dict(label_counts)}")
+    print(f"Label counts: {dict(global_label_counts['val'])}")
+    logging.info(f"Label counts: {dict(global_label_counts['val'])}")
     return acc, running_loss/len(dataloader)
+
 def main(output_path, log_path):
     start_time = time.time()
 
     class Args:
-        # vae_layer = 4
-        # vae_length = 128
-        # vae_test_dim = 55 * 3
         stride = 30
         pose_length = 128
         pose_fps = 30
-
         data_path = "D:\\MingYuan\\Dataset\\beat_v2.0.0\\beat_english_v2.0.0"
         smplx_model_path = "D:\\MingYuan\\smplx_v1.1\\models"
-
         additional_data = False
-        # word_cache = False
-        # train
         loader_type = "train"
-        # cache_path = "path_to_cache"
-        # root_path = "path_to_root"
-
-        # dataset cache
         preloaded_dir = ".\\datasets_cache"
         training_speakers = [2]
         pose_rep = "smplxflame_30"
         ori_joints = "beat_smplx_joints"
         tar_joints = "beat_smplx_full"
         sem_rep = "sem"
-
         facial_rep = None
         new_cache = False
         disable_filtering = False
         multi_length_training = [1.0]
         word_rep = "textgrid"
-
         clean_first_seconds = 0
         clean_final_seconds = 0
-
         t_pre_encoder = "fasttext"
-
         word_cache = False
-
-        threshold = 0.5  #clip level label threshold
+        threshold = 0.7  #clip level label threshold
 
     args = Args()
 
@@ -1048,15 +1217,17 @@ def main(output_path, log_path):
     dataset_end_time = time.time()
 
     data_loader_start_time = time.time()
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  collate_fn=custom_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn)
     data_loader_end_time = time.time()
 
     motion_input_dim = 169  # motion dim
-    text_input_dim = 10000  # 假设词汇表大小为 10000
+    text_input_dim = 11195  # 词汇表大小 vocab_size
     embed_dim = 300  # fastText embedding 的维度
     text_output_dim = 256  # TextEncoder 的输出维度
     hidden_size = 512  # MLP 隐藏层的维度
+    # clip based 2
+    # frame based 3
     num_classes = 3  # 分类数
     seq_len = 128  # 时间步长
 
@@ -1065,7 +1236,7 @@ def main(output_path, log_path):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     train_start_time = time.time()
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, output_path=output_path, log_path=log_path)
+    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, output_path=output_path, log_path=log_path, num_classes=num_classes)
     train_end_time = time.time()
 
     end_time = time.time()
@@ -1082,13 +1253,6 @@ def main(output_path, log_path):
 
 if __name__ == "__main__":
     root = "D:\\MingYuan\\A2M"
-
-    # npz_input_path = os.path.join(root, "2_scott")
-    # textgrid_input_path = os.path.join(root, "2_scott_textgrid")
-    # txt_input_path = os.path.join(root, "2_scott_sem_score")
     output_path = os.path.join(root, "classifier")
     log_path = os.path.join(output_path, "training_log.txt")
-
-    # max_length = 128  # 设置一个合适的最大长度
-
     main(output_path, log_path)
