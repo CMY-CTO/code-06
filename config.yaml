@@ -1,0 +1,55 @@
+model:
+  motion_dim: 169
+  motion_output_dim: 128
+  text_dim: 11195
+  embed_dim: 300
+  text_output_dim: 4
+  hidden_size: 512
+  num_classes: 2
+  UNetDecoder_depth: 4
+  dropout_rate: 0.5
+  period: 32
+  max_seq_len: 128
+
+training:
+  lr: 1e-5
+  num_epochs: 1
+  batch_size: 1
+
+val:
+  batch_size: 1
+
+test:
+  batch_size: 1
+
+dataset:
+  stride: 30
+  pose_length: 128
+  pose_fps: 30
+  data_path: "D:\\MingYuan\\Dataset\\beat_v2.0.0\\beat_english_v2.0.0"
+  smplx_model_path: "D:\\MingYuan\\smplx_v1.1\\models"
+  preloaded_dir: "D:\\MingYuan\\A2M\\code\\classifier\\datasets_cache_frame_2scott"
+  training_speakers: [2]
+  #
+  pose_rep: "smplxflame_30"
+  ori_joints: "beat_smplx_joints"
+  tar_joints: "beat_smplx_full"
+  sem_rep: "sem"
+  word_rep: "textgrid"
+  clean_first_seconds: 0
+  clean_final_seconds: 0
+  t_pre_encoder: "fasttext"
+  word_cache: False
+  threshold: 0.5
+  additional_data: False
+  loader_type: "train"
+  new_cache: True
+  disable_filtering: False
+  multi_length_training: [1.0]
+
+wandb:
+  project: "MTClassifier-frame_CA_M2T_motion128text4_period32—rendertest"
+  entity: "mingyuanchen99-hong-kong-baptist-university"
+  api_key: "2775a70d81665e5051866588c6c179ed89d2ddd0"
+
+label_smoothing: 0.1
