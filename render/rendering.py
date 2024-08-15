@@ -8,6 +8,7 @@ from render import rendering_utils
 from argparse import Namespace
 from moviepy.editor import VideoFileClip, clips_array, ColorClip
 import glob
+import pickle
 
 def get_time_range_from_segment(segment, fps=30, segment_duration=2):
     start_frame = segment * segment_duration * fps
@@ -106,24 +107,40 @@ def arrange_clips(clips, args):
 #直接接受从 test_loader 中提取的样本
 
 def visualize_motion_samples(labels, preds, dataloader, args):
-    # 遍历数据加载器中的样本
+    print(f"labels_length{len(labels)},preds_length{len(preds)}")
+    print("dataloader_length",len(dataloader))
     for i, sample in enumerate(dataloader):
-        # 获取当前样本的真实标签和预测标签
-        true_label = labels[i]
-        pred_label = preds[i]
+        # 直接使用批次的数据进行可视化
+        visualize_motion(sample, args, labels, f"True_batch_{i}")
+        visualize_motion(sample, args, preds, f"Pred_batch_{i}")
 
-        # 渲染每个样本
-        visualize_motion(sample, args, true_label, pred_label)
+def visualize_motion(sample, args, label, label_type):
+    with open(f"{args.data_path}\\weights\\vocab.pkl", 'rb') as f:
+        vocab = pickle.load(f)
+    pose = sample['pose'][0]
+    beta = sample['beta'][0]
+    # word = sample['word'][0]
 
-def visualize_motion(sample, args, true_label, pred_label):
-    pose = sample['pose']
-    beta = sample['beta']
-    word = sample['word']
-    sem = sample['sem']
-    trans = sample['trans']
+    # 将索引转换为单词
+    word_indices = sample['word'][0].tolist()  # 转为列表
+    word = []
+    for idx in word_indices:
+        if 0 <= idx < len(vocab.index2word):
+            word.append(vocab.index2word[idx])
+        else:
+            word.append("<UNK>")  # 未知词处理
 
-    # 使用标签和预测
-    print(f"True Label: {true_label}, Predicted Label: {pred_label}")
+
+    sem = sample['sem'][0]
+    trans = sample['trans'][0]
+    print("pose",pose.shape)
+    print("word",len(word))
+    print("sem",sem.shape)
+    print("beta",beta.shape)
+    print("trans",trans.shape)
+
+    print(f"label_length{len(label)},label_type{label_type}")
+
 
     # 确保保存路径存在
     results_save_path = args.output_path
@@ -138,14 +155,13 @@ def visualize_motion(sample, args, true_label, pred_label):
 
     faces = np.load(f"{args.smplx_model_path}/smplx/SMPLX_NEUTRAL_2020.npz", allow_pickle=True)["f"]
 
-    n = pose.shape[1]
+    n = pose.shape[0]
+    expression = torch.zeros((n, 100)).cpu()
 
-    beta = torch.from_numpy(beta).to(torch.float32).unsqueeze(0).cpu()
-    beta = beta.repeat(n, 1)
-    expression = torch.from_numpy(sample['expressions'][:n]).to(torch.float32).cpu()
-    jaw_pose = torch.from_numpy(pose[:n, 66:69]).to(torch.float32).cpu()
-    pose_tensor = torch.from_numpy(pose[:n]).to(torch.float32).cpu()
-    transl = torch.from_numpy(trans[:n]).to(torch.float32).cpu()
+    # expression = sample['expressions'][:n].cpu()
+    jaw_pose = pose[:n, 66:69].cpu()
+    pose_tensor = pose[:n].cpu()
+    transl = trans[:n].cpu()
 
     output = model(betas=beta, transl=transl, expression=expression, jaw_pose=jaw_pose,
                    global_orient=pose_tensor[:, :3], body_pose=pose_tensor[:, 3:21*3+3],
@@ -153,27 +169,17 @@ def visualize_motion(sample, args, true_label, pred_label):
                    leye_pose=pose_tensor[:, 69:72], reye_pose=pose_tensor[:, 72:75], return_verts=True)
 
     vertices_all = output["vertices"].cpu().detach().numpy()
-
-    # Flip the y-axis to make the model upright
     vertices_all[:, :, 1] = -vertices_all[:, :, 1]
 
     seconds = vertices_all.shape[0] // 30 if not args.debug else 1
 
-    # Output directories for prediction and ground truth
-    pred_folder_output_dir = os.path.join(results_save_path, "pred_video")
-    gt_folder_output_dir = os.path.join(results_save_path, "gt_video")
+    folder_output_dir = os.path.join(results_save_path, f"{label_type}_video")
+    output_filename = os.path.join(folder_output_dir, f"{label_type}_video.mp4")
 
-    # Generate unique output filenames for each video
-    pred_output_filename = os.path.join(pred_folder_output_dir, "pred_video.mp4")
-    gt_output_filename = os.path.join(gt_folder_output_dir, "gt_video.mp4")
+    if not os.path.exists(folder_output_dir):
+        os.makedirs(folder_output_dir)
 
-    if not os.path.exists(pred_folder_output_dir):
-        os.makedirs(pred_folder_output_dir)
-    if not os.path.exists(gt_folder_output_dir):
-        os.makedirs(gt_folder_output_dir)
-
-    # Generate silent video for predictions
-    pred_silent_video_file_path = rendering_utils.generate_silent_videos(
+    video_file_path = rendering_utils.generate_silent_videos(
         args.render_video_fps,
         args.render_video_width,
         args.render_video_height,
@@ -183,48 +189,21 @@ def visualize_motion(sample, args, true_label, pred_label):
         vertices_all,
         [None] * len(vertices_all),
         faces,
-        pred_folder_output_dir,
-        pred_output_filename,
+        folder_output_dir,
+        output_filename,
         sem,
         word,
-        labels=true_label,  # 将真实标签传递给渲染函数
-        preds=pred_label    # 将预测标签传递给渲染函数
+        labels=label
     )
 
-    # Generate silent video for ground truth
-    gt_silent_video_file_path = rendering_utils.generate_silent_videos(
-        args.render_video_fps,
-        args.render_video_width,
-        args.render_video_height,
-        args.render_concurrent_num,
-        'png',
-        int(seconds * args.render_video_fps),
-        vertices_all,
-        [None] * len(vertices_all),
-        faces,
-        gt_folder_output_dir,
-        gt_output_filename,
-        sem,
-        word,
-        labels=true_label,
-        preds=pred_label
-    )
-
-    if pred_silent_video_file_path is None or gt_silent_video_file_path is None:
-        print(f"Silent video generation failed for test.")
+    if video_file_path is None:
+        print(f"Silent video generation failed for {label_type}.")
         return
 
-    # Adjust the video clip sizes
-    pred_clip = VideoFileClip(pred_silent_video_file_path).resize((args.render_video_width, args.render_video_height))
-    gt_clip = VideoFileClip(gt_silent_video_file_path).resize((args.render_video_width, args.render_video_height))
+    clip = VideoFileClip(video_file_path).resize((args.render_video_width, args.render_video_height))
+    clip.write_videofile(output_filename, fps=args.render_video_fps)
 
-    # Combine pred and gt clips
-    combined_clip = clips_array([[pred_clip, gt_clip]])
-
-    combined_final_clip_path = os.path.join(results_save_path, "combined_video.mp4")
-    combined_clip.write_videofile(combined_final_clip_path, fps=args.render_video_fps)
-
-    print(f"Final combined video saved at {combined_final_clip_path}")
+    print(f"Final {label_type} video saved at {output_filename}")
 
 if __name__ == "__main__":
     npz_file_folders = [
